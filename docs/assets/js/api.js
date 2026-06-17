@@ -14,6 +14,35 @@ const Api = (() => {
     roomTemperature: { key: "roomTemperature", name: "室温", unit: "℃" }
   };
 
+  const LEVEL_TEXT = {
+    warning: "提醒",
+    abnormal: "异常",
+    danger: "危险",
+    normal: "正常",
+    "提醒": "提醒",
+    "异常": "异常",
+    "危险": "危险",
+    "正常": "正常"
+  };
+
+  const STATUS_TEXT = {
+    handled: "已处理",
+    pending: "未处理",
+    "已处理": "已处理",
+    "未处理": "未处理"
+  };
+
+  const SENSOR_NAME_TO_KEY = {
+    DO: "do",
+    pH: "ph",
+    "盐度": "salinity",
+    "温度": "temperature",
+    "水温": "temperature",
+    "水位": "waterLevel",
+    ORP: "orp",
+    "室温": "roomTemperature"
+  };
+
   const defaultSettings = {
     doWarn: 5.0,
     doDanger: 4.0,
@@ -35,6 +64,15 @@ const Api = (() => {
     "24h": { label: "24小时" }
   };
 
+  async function requestJson(url, options = {}) {
+    const response = await fetch(url, {
+      headers: { "Content-Type": "application/json" },
+      ...options
+    });
+    if (!response.ok) throw new Error(`API request failed: ${response.status}`);
+    return response.json();
+  }
+
   function readJson(key, fallback) {
     try {
       return JSON.parse(localStorage.getItem(key) || "null") || fallback;
@@ -53,6 +91,13 @@ const Api = (() => {
     if (key === "level") return "waterLevel";
     if (key === "nh3" || key === "ammonia") return null;
     return key;
+  }
+
+  function metricToSensorKey(metric) {
+    if (!metric) return null;
+    const normalized = normalizeSensorKey(metric);
+    if (normalized && SENSOR_DEFINITIONS[normalized]) return normalized;
+    return SENSOR_NAME_TO_KEY[metric] || null;
   }
 
   function normalizeEnabledSensors(enabledSensors) {
@@ -75,14 +120,16 @@ const Api = (() => {
   }
 
   function normalizeDevice(device) {
-    const metric = normalizeMetric(device);
-    if (!metric) return null;
+    const key = normalizeSensorKey(device && device.key);
+    if (!key || !SENSOR_DEFINITIONS[key]) return null;
+    const definition = SENSOR_DEFINITIONS[key];
+    const sensorName = isBadText(device.sensorName) ? definition.name : device.sensorName;
     return {
       ...device,
-      key: metric.key,
-      sensorName: metric.name,
-      unit: metric.unit,
-      name: isBadText(device.name) ? `${metric.name} 传感器` : device.name
+      key,
+      sensorName,
+      unit: isBadText(device.unit) ? definition.unit : device.unit,
+      name: isBadText(device.name) ? `${definition.name} 传感器` : device.name
     };
   }
 
@@ -95,11 +142,11 @@ const Api = (() => {
 
   function normalizeAlarm(alarm) {
     if (!alarm) return null;
-    const key = normalizeSensorKey(alarm.key || alarm.metric || alarm.sensorKey || alarm.sensorName);
+    const key = metricToSensorKey(alarm.key || alarm.metric || alarm.sensorKey || alarm.sensorName);
     if (!key || !SENSOR_DEFINITIONS[key]) return null;
     const definition = SENSOR_DEFINITIONS[key];
-    const level = { warning: "提醒", abnormal: "异常", danger: "危险", normal: "正常" }[alarm.level] || alarm.levelText || alarm.level || "提醒";
-    const status = { handled: "已处理", pending: "未处理" }[alarm.status] || alarm.statusText || alarm.status || "未处理";
+    const level = LEVEL_TEXT[alarm.levelText] || LEVEL_TEXT[alarm.level] || "提醒";
+    const status = STATUS_TEXT[alarm.statusText] || STATUS_TEXT[alarm.status] || "未处理";
     return {
       ...alarm,
       key,
@@ -137,6 +184,28 @@ const Api = (() => {
     };
   }
 
+  function normalizeSensorList(data) {
+    const metrics = (data.metrics || []).map(normalizeMetric).filter(Boolean);
+    const sensors = (data.sensors || []).map(normalizeDevice).filter(Boolean);
+    const allSensors = Object.values(SENSOR_DEFINITIONS).map(definition => ({
+      ...definition,
+      value: data.allSensors?.find(item => item.key === definition.key)?.value,
+      status: "normal",
+      enabled: true
+    }));
+    return { ...data, metrics, sensors, allSensors };
+  }
+
+  function normalizeSettings(settings) {
+    const { nh3Warn, nh3Danger, ...rest } = settings || {};
+    return {
+      ...defaultSettings,
+      ...rest,
+      pondCount: Number(rest.pondCount || 4),
+      enabledSensors: normalizeEnabledSensors(rest.enabledSensors)
+    };
+  }
+
   function getMockAlarmState() {
     const handledIds = readJson(ALARM_HANDLED_KEY, []);
     return MockData.generateAlarms().map(alarm => ({
@@ -146,62 +215,70 @@ const Api = (() => {
   }
 
   async function getLatestData() {
+    if (DATA_MODE === "api") {
+      return normalizeLatestData(await requestJson("/api/latest"));
+    }
+
     const config = MockData.getSystemConfig();
+    const metrics = MockData.getRealtimeSensors();
     return normalizeLatestData({
       config,
       system: MockData.getSystemSummary(),
       ponds: MockData.generatePonds(config.pondCount),
-      metrics: MockData.getRealtimeSensors(),
+      metrics,
       alarms: getMockAlarmState(),
       devices: MockData.getSensorDevices()
     });
   }
 
   async function getHistoryData(metric, range) {
-    return MockData.generateHistoryData(normalizeSensorKey(metric) || "do", range);
+    const key = normalizeSensorKey(metric) || "do";
+    if (DATA_MODE === "api") {
+      return requestJson(`/api/history?metric=${encodeURIComponent(key)}&range=${encodeURIComponent(range)}`);
+    }
+    return MockData.generateHistoryData(key, range);
   }
 
   async function getAlarmList() {
-    return getMockAlarmState().map(normalizeAlarm).filter(Boolean);
+    const alarms = DATA_MODE === "api" ? await requestJson("/api/alarms") : getMockAlarmState();
+    return alarms.map(normalizeAlarm).filter(Boolean);
   }
 
   async function getSensorList() {
-    const data = {
+    if (DATA_MODE === "api") {
+      return normalizeSensorList(await requestJson("/api/sensors"));
+    }
+
+    return normalizeSensorList({
       sensors: MockData.getSensorDevices(),
       metrics: MockData.getRealtimeSensors(),
       allSensors: MockData.sensors,
       operations: MockData.operations,
       exceptions: MockData.exceptions
-    };
-    return {
-      ...data,
-      metrics: data.metrics.map(normalizeMetric).filter(Boolean),
-      sensors: data.sensors.map(normalizeDevice).filter(Boolean),
-      allSensors: Object.values(SENSOR_DEFINITIONS).map(definition => ({
-        ...definition,
-        value: data.allSensors.find(item => item.key === definition.key)?.value,
-        status: "normal",
-        enabled: true
-      }))
-    };
+    });
   }
 
   async function getSettings() {
+    if (DATA_MODE === "api") {
+      return normalizeSettings(await requestJson("/api/settings"));
+    }
+
     const saved = readJson(SETTINGS_KEY, {});
-    return {
-      ...defaultSettings,
+    return normalizeSettings({
       ...saved,
-      ...MockData.getSystemConfig(),
-      enabledSensors: normalizeEnabledSensors(saved.enabledSensors || MockData.getSystemConfig().enabledSensors)
-    };
+      ...MockData.getSystemConfig()
+    });
   }
 
   async function saveSettings(settings) {
-    const cleanSettings = {
-      ...defaultSettings,
-      ...settings,
-      enabledSensors: normalizeEnabledSensors(settings.enabledSensors)
-    };
+    const cleanSettings = normalizeSettings(settings);
+    if (DATA_MODE === "api") {
+      return requestJson("/api/settings", {
+        method: "POST",
+        body: JSON.stringify(cleanSettings)
+      });
+    }
+
     const { pondCount, enabledSensors, ...thresholdSettings } = cleanSettings;
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...defaultSettings, ...thresholdSettings }));
     MockData.saveSystemConfig({ pondCount, enabledSensors });
@@ -209,6 +286,12 @@ const Api = (() => {
   }
 
   async function handleAlarm(alarmId) {
+    if (DATA_MODE === "api") {
+      return requestJson(`/api/alarms/${encodeURIComponent(alarmId)}/handled`, {
+        method: "POST"
+      });
+    }
+
     const handledIds = readJson(ALARM_HANDLED_KEY, []);
     if (!handledIds.includes(alarmId)) handledIds.push(alarmId);
     localStorage.setItem(ALARM_HANDLED_KEY, JSON.stringify(handledIds));
@@ -216,6 +299,7 @@ const Api = (() => {
   }
 
   async function getFeedingPlans() {
+    if (DATA_MODE === "api") return requestJson("/api/feeding/plans");
     return [
       { id: 1, pond: "1号池", time: "08:30", feedName: "南美白对虾配合饲料", amountKg: 12.5, enabled: true },
       { id: 2, pond: "2号池", time: "12:30", feedName: "南美白对虾配合饲料", amountKg: 10, enabled: true }
@@ -223,10 +307,17 @@ const Api = (() => {
   }
 
   async function saveFeedingPlan(plan) {
+    if (DATA_MODE === "api") {
+      return requestJson("/api/feeding/plans", {
+        method: "POST",
+        body: JSON.stringify(plan)
+      });
+    }
     return { success: true, id: Date.now(), ...plan };
   }
 
   async function getCameras() {
+    if (DATA_MODE === "api") return requestJson("/api/cameras");
     return [
       { id: 1, name: "1号池枪机", location: "1号池", streamUrl: "rtsp://example.local/pond1", status: "在线" },
       { id: 2, name: "车间全景", location: "养殖车间", streamUrl: "rtsp://example.local/workshop", status: "在线" }
