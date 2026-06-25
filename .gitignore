@@ -4,9 +4,3 @@ __pycache__/
 data/*.db
 .env
 node_modules/
-.venv/
-__pycache__/
-*.pyc
-data/*.db
-.env
-node_modules/

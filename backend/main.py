@@ -1,707 +1,854 @@
+import hashlib
+import hmac
 import json
 import math
+import os
+import secrets
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+import jwt
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "jinmengwan.db"
-
-DEFAULT_SETTINGS = {
-    "doWarn": 5.0,
-    "doDanger": 4.0,
-    "phMin": 7.6,
-    "phMax": 8.6,
-    "salinityMin": 8,
-    "salinityMax": 18,
-    "tempMin": 26,
-    "tempMax": 32,
-    "levelMin": 60,
-    "levelMax": 95,
-    "pondCount": 4,
-    "enabledSensors": ["do", "ph", "salinity", "temperature", "waterLevel", "orp", "roomTemperature"],
-}
+JWT_SECRET = os.getenv("JWT_SECRET", "change-this-secret-before-production")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_MINUTES = 8 * 60
+GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "jmw-demo-gateway-token")
 
 SENSOR_DEFINITIONS = {
-    "do": {"key": "do", "name": "DO", "unit": "mg/L", "value": 6.8, "status": "normal", "min": 5.0, "max": 9.0},
-    "ph": {"key": "ph", "name": "pH", "unit": "", "value": 8.1, "status": "normal", "min": 7.6, "max": 8.6},
-    "salinity": {"key": "salinity", "name": "盐度", "unit": "ppt", "value": 12, "status": "normal", "min": 8, "max": 18},
-    "temperature": {"key": "temperature", "name": "温度", "unit": "℃", "value": 28.3, "status": "normal", "min": 26, "max": 32},
-    "waterLevel": {"key": "waterLevel", "name": "水位", "unit": "cm", "value": 79, "status": "normal", "min": 60, "max": 95},
-    "orp": {"key": "orp", "name": "ORP", "unit": "mV", "value": 220, "status": "normal", "min": 180, "max": 280},
-    "roomTemperature": {"key": "roomTemperature", "name": "室温", "unit": "℃", "value": 27.2, "status": "normal", "min": 18, "max": 36},
+    "do": {"name": "DO", "unit": "mg/L", "base": 6.8},
+    "water_temp": {"name": "水温", "unit": "℃", "base": 28.5},
+    "ph": {"name": "pH", "unit": "", "base": 8.1},
+    "orp": {"name": "ORP", "unit": "mV", "base": 220},
+    "water_level": {"name": "水位", "unit": "cm", "base": 80},
+    "salinity": {"name": "盐度", "unit": "ppt", "base": 12.0},
+    "room_temp": {"name": "室温", "unit": "℃", "base": 27.2},
 }
 
-SENSORS = list(SENSOR_DEFINITIONS.values())
-
-LEVEL_TEXT = {
-    "warning": "提醒",
-    "abnormal": "异常",
-    "danger": "危险",
-    "normal": "正常",
-    "提醒": "提醒",
-    "异常": "异常",
-    "危险": "危险",
-    "正常": "正常",
+DEFAULT_THRESHOLDS = {
+    "do_min": 5.0,
+    "do_danger": 4.0,
+    "water_temp_min": 26.0,
+    "water_temp_max": 32.0,
+    "ph_min": 7.6,
+    "ph_max": 8.6,
+    "orp_min": 180.0,
+    "orp_max": 280.0,
+    "water_level_min": 60.0,
+    "water_level_max": 95.0,
 }
 
-STATUS_TEXT = {
-    "handled": "已处理",
-    "pending": "未处理",
-    "已处理": "已处理",
-    "未处理": "未处理",
-}
-
-SENSOR_NAME_TO_KEY = {
-    "DO": "do",
-    "pH": "ph",
-    "盐度": "salinity",
-    "温度": "temperature",
-    "水温": "temperature",
-    "水位": "waterLevel",
-    "ORP": "orp",
-    "室温": "roomTemperature",
-}
-
-ALARM_SEED_ROWS = [
-    ("2026-06-16 08:10:22", "1号池", "DO", "4.8 mg/L", "提醒", "溶解氧接近提醒阈值", "未处理"),
-    ("2026-06-16 07:42:16", "2号池", "pH", "8.7", "异常", "pH 高于上限", "未处理"),
-    ("2026-06-15 19:35:08", "4号池", "水位", "58 cm", "异常", "水位低于下限", "已处理"),
-    ("2026-06-15 16:06:51", "1号池", "温度", "32.8 ℃", "提醒", "水温偏高", "已处理"),
-    ("2026-06-15 11:28:23", "3号池", "ORP", "165 mV", "提醒", "ORP 低于建议范围", "已处理"),
-    ("2026-06-15 08:20:12", "1号池", "室温", "35.4 ℃", "提醒", "室温偏高", "已处理"),
-]
-
-RANGE_STEPS = {
-    "30m": 1,
-    "1h": 2,
-    "6h": 12,
-    "12h": 24,
-    "24h": 48,
-}
-
-
-class SettingsPayload(BaseModel):
-    doWarn: float | None = None
-    doDanger: float | None = None
-    phMin: float | None = None
-    phMax: float | None = None
-    salinityMin: float | None = None
-    salinityMax: float | None = None
-    tempMin: float | None = None
-    tempMax: float | None = None
-    levelMin: float | None = None
-    levelMax: float | None = None
-    pondCount: int | None = None
-    enabledSensors: list[str] | None = None
-
-
-class FeedingPlanPayload(BaseModel):
-    pond: str
-    time: str
-    feedName: str
-    amountKg: float
-    enabled: bool = True
-
-
-app = FastAPI(title="金梦湾渔业水质在线监测平台 API")
+app = FastAPI(title="金梦湾渔业水质在线监测平台 API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+security = HTTPBearer(auto_error=False)
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class ThresholdPayload(BaseModel):
+    farm_id: int
+    values: dict[str, float]
+
+
+class FeedPlanPayload(BaseModel):
+    farm_id: int
+    pond_id: int
+    feed_time: str
+    feed_name: str
+    amount_kg: float = Field(gt=0)
+    enabled: bool = True
+
+
+class GatewayReadingPayload(BaseModel):
+    farm_id: int
+    pond_id: int
+    device_id: int
+    do_value: float | None = None
+    water_temp: float | None = None
+    ph_value: float | None = None
+    orp_value: float | None = None
+    water_level: float | None = None
+    salinity: float | None = None
+    room_temp: float | None = None
+    system_status: str = "normal"
+    alarm_status: str = "normal"
+    communication_status: str = "online"
+    timestamp: str | None = None
+
+
+class FarmPayload(BaseModel):
+    name: str
+    location: str = ""
+    pond_count: int = Field(default=4, ge=1, le=100)
+
+
+class UserPayload(BaseModel):
+    username: str
+    display_name: str
+    password: str = Field(min_length=6)
+    role: str = "operator"
+    farm_ids: list[int] = []
 
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def execute_schema() -> None:
+def password_hash(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000)
+    return f"{salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, expected = stored.split("$", 1)
+    except ValueError:
+        return False
+    actual = password_hash(password, salt).split("$", 1)[1]
+    return hmac.compare_digest(actual, expected)
+
+
+def create_token(user: sqlite3.Row) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user["id"]),
+        "username": user["username"],
+        "role": user["role"],
+        "iat": now,
+        "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict[str, Any]:
+    if not credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = int(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="登录已失效")
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, username, display_name, role, active FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row or not row["active"]:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不可用")
+    return dict(row)
+
+
+def require_admin(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
+def accessible_farm_ids(user: dict[str, Any]) -> list[int]:
+    with get_conn() as conn:
+        if user["role"] == "admin":
+            rows = conn.execute("SELECT id FROM farms WHERE active = 1 ORDER BY id").fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT f.id FROM farms f
+                JOIN user_farms uf ON uf.farm_id = f.id
+                WHERE uf.user_id = ? AND f.active = 1
+                ORDER BY f.id
+                """,
+                (user["id"],),
+            ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def ensure_farm_access(user: dict[str, Any], farm_id: int | None) -> int:
+    farm_ids = accessible_farm_ids(user)
+    if not farm_ids:
+        raise HTTPException(status_code=403, detail="当前用户未绑定养殖场")
+    selected = farm_id or farm_ids[0]
+    if selected not in farm_ids:
+        raise HTTPException(status_code=403, detail="无权访问该养殖场")
+    return selected
+
+
+def create_schema() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with get_conn() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS sensor_data (
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sensor_key TEXT NOT NULL,
-                sensor_name TEXT NOT NULL,
-                unit TEXT,
-                value REAL NOT NULL,
-                pond_no INTEGER NOT NULL,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'operator',
+                active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
-
-            CREATE TABLE IF NOT EXISTS alarm_log (
+            CREATE TABLE IF NOT EXISTS farms (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                time TEXT NOT NULL,
-                pool TEXT NOT NULL,
-                metric TEXT NOT NULL,
-                value TEXT NOT NULL,
-                level TEXT NOT NULL,
-                content TEXT NOT NULL,
-                status TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sensor_config (
-                sensor_key TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                unit TEXT,
-                base_value REAL NOT NULL,
-                status TEXT NOT NULL,
+                location TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_farms (
+                user_id INTEGER NOT NULL,
+                farm_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, farm_id),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (farm_id) REFERENCES farms(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS ponds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farm_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                FOREIGN KEY (farm_id) REFERENCES farms(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farm_id INTEGER NOT NULL,
+                pond_id INTEGER,
+                device_code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                device_type TEXT NOT NULL,
+                communication_status TEXT NOT NULL DEFAULT 'online',
+                last_seen TEXT,
+                FOREIGN KEY (farm_id) REFERENCES farms(id) ON DELETE CASCADE,
+                FOREIGN KEY (pond_id) REFERENCES ponds(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS sensor_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farm_id INTEGER NOT NULL,
+                pond_id INTEGER NOT NULL,
+                device_id INTEGER NOT NULL,
+                do_value REAL,
+                water_temp REAL,
+                ph_value REAL,
+                orp_value REAL,
+                water_level REAL,
+                salinity REAL,
+                room_temp REAL,
+                system_status TEXT NOT NULL,
+                alarm_status TEXT NOT NULL,
+                communication_status TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (farm_id) REFERENCES farms(id),
+                FOREIGN KEY (pond_id) REFERENCES ponds(id),
+                FOREIGN KEY (device_id) REFERENCES devices(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_readings_farm_time
+                ON sensor_readings(farm_id, timestamp DESC);
+            CREATE TABLE IF NOT EXISTS alarm_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farm_id INTEGER NOT NULL,
+                pond_id INTEGER NOT NULL,
+                device_id INTEGER,
+                metric TEXT NOT NULL,
+                value REAL NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                handled_at TEXT,
+                handled_by INTEGER,
+                FOREIGN KEY (farm_id) REFERENCES farms(id),
+                FOREIGN KEY (pond_id) REFERENCES ponds(id)
+            );
+            CREATE TABLE IF NOT EXISTS thresholds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farm_id INTEGER NOT NULL,
+                metric TEXT NOT NULL,
                 min_value REAL,
                 max_value REAL,
-                enabled INTEGER NOT NULL DEFAULT 1
+                UNIQUE(farm_id, metric),
+                FOREIGN KEY (farm_id) REFERENCES farms(id) ON DELETE CASCADE
             );
-
-            CREATE TABLE IF NOT EXISTS feeding_plan (
+            CREATE TABLE IF NOT EXISTS feed_plans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pond TEXT NOT NULL,
-                time TEXT NOT NULL,
+                farm_id INTEGER NOT NULL,
+                pond_id INTEGER NOT NULL,
+                feed_time TEXT NOT NULL,
                 feed_name TEXT NOT NULL,
                 amount_kg REAL NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS camera_config (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                location TEXT NOT NULL,
-                stream_url TEXT NOT NULL,
-                status TEXT NOT NULL
+                enabled INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (farm_id) REFERENCES farms(id),
+                FOREIGN KEY (pond_id) REFERENCES ponds(id)
             );
             """
         )
 
 
-def table_count(conn: sqlite3.Connection, table: str) -> int:
-    return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-
-
-def seed_database_if_empty() -> None:
+def seed_database() -> None:
+    now = datetime.now()
     with get_conn() as conn:
-        if table_count(conn, "settings") == 0:
-            for key, value in DEFAULT_SETTINGS.items():
-                conn.execute(
-                    "INSERT INTO settings (key, value) VALUES (?, ?)",
-                    (key, json.dumps(value, ensure_ascii=False)),
-                )
-
-        if table_count(conn, "sensor_config") == 0:
-            enabled = set(DEFAULT_SETTINGS["enabledSensors"])
+        if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             conn.executemany(
                 """
-                INSERT INTO sensor_config
-                (sensor_key, name, unit, base_value, status, min_value, max_value, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users (username, display_name, password_hash, role, active, created_at)
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                [
+                    ("admin", "系统管理员", password_hash("Admin123!"), "admin", now.isoformat()),
+                    ("operator1", "一号场操作员", password_hash("Demo123!"), "operator", now.isoformat()),
+                    ("operator2", "二号场操作员", password_hash("Demo123!"), "operator", now.isoformat()),
+                ],
+            )
+        if conn.execute("SELECT COUNT(*) FROM farms").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO farms (name, location, active, created_at) VALUES (?, ?, 1, ?)",
+                [
+                    ("金梦湾一号养殖场", "广东省湛江市", now.isoformat()),
+                    ("金梦湾二号养殖场", "广东省阳江市", now.isoformat()),
+                ],
+            )
+        if conn.execute("SELECT COUNT(*) FROM ponds").fetchone()[0] == 0:
+            farms = conn.execute("SELECT id FROM farms ORDER BY id").fetchall()
+            for farm in farms:
+                pond_count = 4 if farm["id"] == farms[0]["id"] else 3
+                conn.executemany(
+                    "INSERT INTO ponds (farm_id, name, code, status) VALUES (?, ?, ?, 'running')",
+                    [(farm["id"], f"{i}号池", f"P{i:02d}") for i in range(1, pond_count + 1)],
+                )
+        if conn.execute("SELECT COUNT(*) FROM user_farms").fetchone()[0] == 0:
+            users = {row["username"]: row["id"] for row in conn.execute("SELECT id, username FROM users")}
+            farms = [row["id"] for row in conn.execute("SELECT id FROM farms ORDER BY id")]
+            links = []
+            if farms:
+                links.append((users["operator1"], farms[0]))
+            if len(farms) > 1:
+                links.append((users["operator2"], farms[1]))
+            conn.executemany("INSERT OR IGNORE INTO user_farms (user_id, farm_id) VALUES (?, ?)", links)
+        if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0:
+            ponds = conn.execute("SELECT id, farm_id, name FROM ponds ORDER BY farm_id, id").fetchall()
+            conn.executemany(
+                """
+                INSERT INTO devices
+                (farm_id, pond_id, device_code, name, device_type, communication_status, last_seen)
+                VALUES (?, ?, ?, ?, 'water_gateway', 'online', ?)
                 """,
                 [
                     (
-                        sensor["key"],
-                        sensor["name"],
-                        sensor["unit"],
-                        sensor["value"],
-                        sensor["status"],
-                        sensor["min"],
-                        sensor["max"],
-                        1 if sensor["key"] in enabled else 0,
+                        pond["farm_id"],
+                        pond["id"],
+                        f"JMW-F{pond['farm_id']:02d}-P{pond['id']:03d}",
+                        f"{pond['name']}水质采集网关",
+                        now.isoformat(timespec="seconds"),
                     )
-                    for sensor in SENSORS
+                    for pond in ponds
                 ],
             )
-
-        if table_count(conn, "sensor_data") == 0:
-            now = datetime.now()
+        if conn.execute("SELECT COUNT(*) FROM thresholds").fetchone()[0] == 0:
+            farm_ids = [row["id"] for row in conn.execute("SELECT id FROM farms")]
+            metric_rows = [
+                ("do", DEFAULT_THRESHOLDS["do_danger"], None),
+                ("water_temp", DEFAULT_THRESHOLDS["water_temp_min"], DEFAULT_THRESHOLDS["water_temp_max"]),
+                ("ph", DEFAULT_THRESHOLDS["ph_min"], DEFAULT_THRESHOLDS["ph_max"]),
+                ("orp", DEFAULT_THRESHOLDS["orp_min"], DEFAULT_THRESHOLDS["orp_max"]),
+                ("water_level", DEFAULT_THRESHOLDS["water_level_min"], DEFAULT_THRESHOLDS["water_level_max"]),
+            ]
+            conn.executemany(
+                "INSERT OR IGNORE INTO thresholds (farm_id, metric, min_value, max_value) VALUES (?, ?, ?, ?)",
+                [(farm_id, metric, low, high) for farm_id in farm_ids for metric, low, high in metric_rows],
+            )
+        if conn.execute("SELECT COUNT(*) FROM sensor_readings").fetchone()[0] == 0:
+            devices = conn.execute("SELECT id, farm_id, pond_id FROM devices ORDER BY id").fetchall()
             rows = []
-            for index in range(30):
-                created_at = now - timedelta(minutes=(29 - index))
-                for sensor in SENSORS:
-                    span = 0.08 if sensor["key"] == "ph" else max(1, sensor["value"] * 0.035)
-                    value = sensor["value"] + math.sin(index / 3) * span + math.cos(index / 5) * span * 0.45
-                    if sensor["key"] in {"waterLevel", "orp"}:
-                        value = round(value)
-                    elif sensor["key"] == "ph":
-                        value = round(value, 2)
-                    else:
-                        value = round(value, 1)
-                    rows.append((sensor["key"], sensor["name"], sensor["unit"], value, (index % 4) + 1, created_at.isoformat(timespec="seconds")))
+            for point in range(48):
+                ts = now - timedelta(minutes=(47 - point) * 30)
+                for device in devices:
+                    phase = point / 4 + device["pond_id"] * 0.3
+                    rows.append(
+                        (
+                            device["farm_id"], device["pond_id"], device["id"],
+                            round(6.8 + math.sin(phase) * 0.35, 2),
+                            round(28.5 + math.sin(phase / 2) * 1.1, 2),
+                            round(8.1 + math.cos(phase) * 0.12, 2),
+                            round(220 + math.sin(phase) * 18, 1),
+                            round(80 + math.cos(phase / 2) * 4, 1),
+                            round(12 + math.sin(phase / 3) * 0.8, 2),
+                            round(27.2 + math.cos(phase / 2) * 1.4, 2),
+                            "normal", "normal", "online", ts.isoformat(timespec="seconds"),
+                        )
+                    )
             conn.executemany(
                 """
-                INSERT INTO sensor_data (sensor_key, sensor_name, unit, value, pond_no, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO sensor_readings
+                (farm_id, pond_id, device_id, do_value, water_temp, ph_value, orp_value,
+                 water_level, salinity, room_temp, system_status, alarm_status,
+                 communication_status, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
-
-        if table_count(conn, "alarm_log") == 0:
+        if conn.execute("SELECT COUNT(*) FROM alarm_logs").fetchone()[0] == 0:
+            devices = conn.execute("SELECT id, farm_id, pond_id FROM devices ORDER BY id LIMIT 6").fetchall()
+            metrics = [("do", 4.8, "warning", "溶解氧接近提醒阈值"), ("ph", 8.7, "abnormal", "pH 高于上限"), ("orp", 168, "warning", "ORP 低于建议范围")]
             conn.executemany(
                 """
-                INSERT INTO alarm_log (time, pool, metric, value, level, content, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO alarm_logs
+                (farm_id, pond_id, device_id, metric, value, level, message, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                 """,
-                ALARM_SEED_ROWS,
-            )
-
-        if table_count(conn, "feeding_plan") == 0:
-            conn.executemany(
-                "INSERT INTO feeding_plan (pond, time, feed_name, amount_kg, enabled) VALUES (?, ?, ?, ?, ?)",
                 [
-                    ("1号池", "08:30", "南美白对虾配合饲料", 12.5, 1),
-                    ("2号池", "12:30", "南美白对虾配合饲料", 10.0, 1),
-                    ("3号池", "18:00", "强化营养饲料", 9.5, 1),
+                    (
+                        device["farm_id"], device["pond_id"], device["id"],
+                        metrics[i % len(metrics)][0], metrics[i % len(metrics)][1],
+                        metrics[i % len(metrics)][2], metrics[i % len(metrics)][3],
+                        (now - timedelta(hours=i + 1)).isoformat(timespec="seconds"),
+                    )
+                    for i, device in enumerate(devices)
                 ],
             )
-
-        if table_count(conn, "camera_config") == 0:
-            conn.executemany(
-                "INSERT INTO camera_config (name, location, stream_url, status) VALUES (?, ?, ?, ?)",
-                [
-                    ("1号池枪机", "1号池", "rtsp://example.local/pond1", "在线"),
-                    ("2号池枪机", "2号池", "rtsp://example.local/pond2", "在线"),
-                    ("车间全景", "养殖车间", "rtsp://example.local/workshop", "在线"),
-                ],
-            )
-
-
-def repair_legacy_sensor_data() -> None:
-    enabled = DEFAULT_SETTINGS["enabledSensors"]
-    with get_conn() as conn:
-        conn.execute("DELETE FROM sensor_config WHERE sensor_key IN ('ammonia', 'nh3')")
-        conn.execute("DELETE FROM sensor_data WHERE sensor_key IN ('ammonia', 'nh3')")
-        bad_metric_names = ("氨氮", "ammonia", "nh3", chr(63) * 2, chr(63))
-        conn.execute(
-            f"DELETE FROM alarm_log WHERE metric IN ({','.join('?' for _ in bad_metric_names)})",
-            bad_metric_names,
-        )
-        conn.execute(
-            """
-            DELETE FROM alarm_log
-            WHERE pool LIKE '%?%'
-               OR level LIKE '%?%'
-               OR status LIKE '%?%'
-               OR content LIKE '%?%'
-               OR level NOT IN ('提醒', '异常', '危险', '正常', 'warning', 'abnormal', 'danger', 'normal')
-               OR status NOT IN ('已处理', '未处理', 'handled', 'pending')
-            """
-        )
-        if conn.execute("SELECT COUNT(*) FROM alarm_log").fetchone()[0] == 0:
+        if conn.execute("SELECT COUNT(*) FROM feed_plans").fetchone()[0] == 0:
+            ponds = conn.execute("SELECT id, farm_id FROM ponds ORDER BY farm_id, id LIMIT 5").fetchall()
             conn.executemany(
                 """
-                INSERT INTO alarm_log (time, pool, metric, value, level, content, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO feed_plans (farm_id, pond_id, feed_time, feed_name, amount_kg, enabled)
+                VALUES (?, ?, ?, '对虾配合饲料', ?, 1)
                 """,
-                ALARM_SEED_ROWS,
-            )
-        conn.execute("DELETE FROM settings WHERE key IN ('nh3Warn', 'nh3Danger')")
-
-        for sensor in SENSORS:
-            conn.execute(
-                """
-                INSERT INTO sensor_config
-                (sensor_key, name, unit, base_value, status, min_value, max_value, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sensor_key) DO UPDATE SET
-                    name = excluded.name,
-                    unit = excluded.unit,
-                    base_value = excluded.base_value,
-                    status = excluded.status,
-                    min_value = excluded.min_value,
-                    max_value = excluded.max_value,
-                    enabled = excluded.enabled
-                """,
-                (
-                    sensor["key"],
-                    sensor["name"],
-                    sensor["unit"],
-                    sensor["value"],
-                    sensor["status"],
-                    sensor["min"],
-                    sensor["max"],
-                    1 if sensor["key"] in enabled else 0,
-                ),
-            )
-
-        current_settings = {}
-        for row in conn.execute("SELECT key, value FROM settings").fetchall():
-            try:
-                current_settings[row["key"]] = json.loads(row["value"])
-            except json.JSONDecodeError:
-                current_settings[row["key"]] = row["value"]
-        current_settings.update({
-            "enabledSensors": [key for key in current_settings.get("enabledSensors", enabled) if key in SENSOR_DEFINITIONS],
-        })
-        if not current_settings["enabledSensors"]:
-            current_settings["enabledSensors"] = enabled
-        if "roomTemperature" not in current_settings["enabledSensors"]:
-            current_settings["enabledSensors"].append("roomTemperature")
-        for key, value in DEFAULT_SETTINGS.items():
-            current_settings.setdefault(key, value)
-        for key in ("nh3Warn", "nh3Danger"):
-            current_settings.pop(key, None)
-        for key, value in current_settings.items():
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                (key, json.dumps(value, ensure_ascii=False)),
-            )
-
-        if conn.execute("SELECT COUNT(*) FROM sensor_data WHERE sensor_key = 'roomTemperature'").fetchone()[0] == 0:
-            now = datetime.now()
-            room = SENSOR_DEFINITIONS["roomTemperature"]
-            rows = []
-            for index in range(30):
-                created_at = now - timedelta(minutes=(29 - index))
-                span = max(1, room["value"] * 0.035)
-                value = round(room["value"] + math.sin(index / 3) * span + math.cos(index / 5) * span * 0.45, 1)
-                rows.append((room["key"], room["name"], room["unit"], value, (index % 4) + 1, created_at.isoformat(timespec="seconds")))
-            conn.executemany(
-                """
-                INSERT INTO sensor_data (sensor_key, sensor_name, unit, value, pond_no, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                rows,
+                [(pond["farm_id"], pond["id"], "08:30", 10 + index) for index, pond in enumerate(ponds)],
             )
 
 
 @app.on_event("startup")
 def startup() -> None:
-    execute_schema()
-    seed_database_if_empty()
-    repair_legacy_sensor_data()
+    create_schema()
+    seed_database()
 
 
-def read_settings() -> dict[str, Any]:
-    with get_conn() as conn:
-        rows = conn.execute("SELECT key, value FROM settings").fetchall()
-    settings = DEFAULT_SETTINGS.copy()
-    for row in rows:
-        try:
-            settings[row["key"]] = json.loads(row["value"])
-        except json.JSONDecodeError:
-            settings[row["key"]] = row["value"]
-    settings["pondCount"] = max(1, min(50, int(settings.get("pondCount") or 4)))
-    settings["enabledSensors"] = [key for key in settings.get("enabledSensors", []) if key in SENSOR_DEFINITIONS]
-    if not settings["enabledSensors"]:
-        settings["enabledSensors"] = DEFAULT_SETTINGS["enabledSensors"]
-    settings.pop("nh3Warn", None)
-    settings.pop("nh3Danger", None)
-    return settings
-
-
-def write_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    current = read_settings()
-    current.update({key: value for key, value in settings.items() if value is not None})
-    current["pondCount"] = max(1, min(50, int(current.get("pondCount") or 4)))
-    enabled = [key for key in current.get("enabledSensors", []) if key in SENSOR_DEFINITIONS]
-    current["enabledSensors"] = enabled or DEFAULT_SETTINGS["enabledSensors"]
-    current.pop("nh3Warn", None)
-    current.pop("nh3Danger", None)
-
-    with get_conn() as conn:
-        for key, value in current.items():
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                (key, json.dumps(value, ensure_ascii=False)),
-            )
-        conn.execute("UPDATE sensor_config SET enabled = 0")
-        conn.executemany(
-            "UPDATE sensor_config SET enabled = 1 WHERE sensor_key = ?",
-            [(key,) for key in current["enabledSensors"]],
-        )
-    return current
-
-
-def enabled_sensor_rows() -> list[sqlite3.Row]:
-    settings = read_settings()
-    enabled = settings["enabledSensors"]
-    placeholders = ",".join("?" for _ in enabled)
+def latest_rows(farm_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
-            f"""
-            SELECT sensor_key, name, unit, base_value, status, min_value, max_value, enabled
-            FROM sensor_config
-            WHERE sensor_key IN ({placeholders})
-            ORDER BY CASE sensor_key
-                WHEN 'do' THEN 1 WHEN 'ph' THEN 2 WHEN 'salinity' THEN 3
-                WHEN 'temperature' THEN 4 WHEN 'waterLevel' THEN 5
-                WHEN 'orp' THEN 6 WHEN 'roomTemperature' THEN 7 ELSE 99 END
+            """
+            SELECT sr.*, p.name AS pond_name, d.name AS device_name
+            FROM sensor_readings sr
+            JOIN ponds p ON p.id = sr.pond_id
+            JOIN devices d ON d.id = sr.device_id
+            JOIN (
+                SELECT pond_id, MAX(timestamp) AS max_time
+                FROM sensor_readings WHERE farm_id = ? GROUP BY pond_id
+            ) latest ON latest.pond_id = sr.pond_id AND latest.max_time = sr.timestamp
+            WHERE sr.farm_id = ?
+            ORDER BY sr.pond_id
             """,
-            enabled,
+            (farm_id, farm_id),
         ).fetchall()
 
 
-def sensor_to_metric(row: sqlite3.Row) -> dict[str, Any]:
-    latest = latest_sensor_value(row["sensor_key"])
-    definition = SENSOR_DEFINITIONS.get(row["sensor_key"], {})
+def reading_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {
-        "key": row["sensor_key"],
-        "name": definition.get("name") or row["name"],
-        "unit": definition.get("unit", row["unit"] or ""),
-        "value": latest if latest is not None else row["base_value"],
-        "status": row["status"],
-        "min": row["min_value"],
-        "max": row["max_value"],
+        "farm_id": row["farm_id"],
+        "pond_id": row["pond_id"],
+        "pond_name": row["pond_name"],
+        "device_id": row["device_id"],
+        "device_name": row["device_name"],
+        "do_value": row["do_value"],
+        "water_temp": row["water_temp"],
+        "ph_value": row["ph_value"],
+        "orp_value": row["orp_value"],
+        "water_level": row["water_level"],
+        "salinity": row["salinity"],
+        "room_temp": row["room_temp"],
+        "system_status": row["system_status"],
+        "alarm_status": row["alarm_status"],
+        "communication_status": row["communication_status"],
+        "timestamp": row["timestamp"],
     }
 
 
-def latest_sensor_value(sensor_key: str) -> float | None:
+@app.post("/api/auth/login")
+def login(payload: LoginPayload) -> dict[str, Any]:
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT value FROM sensor_data WHERE sensor_key = ? ORDER BY created_at DESC, id DESC LIMIT 1",
-            (sensor_key,),
-        ).fetchone()
-    return None if row is None else row["value"]
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (payload.username,)).fetchone()
+    if not user or not user["active"] or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return {"access_token": create_token(user), "token_type": "bearer"}
 
 
-def build_ponds(pond_count: int) -> list[dict[str, Any]]:
-    return [{"id": index + 1, "name": f"{index + 1}号池", "status": "运行中"} for index in range(pond_count)]
+@app.get("/api/auth/me")
+def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return {**user, "farm_ids": accessible_farm_ids(user)}
 
 
-def metric_to_sensor_key(metric: str | None) -> str | None:
-    if not metric:
-        return None
-    if metric in SENSOR_DEFINITIONS:
-        return metric
-    if metric in {"ammonia", "nh3", "氨氮"}:
-        return None
-    return SENSOR_NAME_TO_KEY.get(metric)
-
-
-def normalize_pond_name(pool: str | None, pond_id: Any = None) -> str:
-    if pool and "号池" in pool and "?" not in pool:
-        return pool
-    if pond_id:
-        return f"{pond_id}号池"
-    digits = "".join(ch for ch in str(pool or "") if ch.isdigit())
-    return f"{digits or 1}号池"
-
-
-def alarm_rows() -> list[dict[str, Any]]:
-    enabled_names = {row["name"] for row in enabled_sensor_rows()}
+@app.get("/api/farms")
+def farms(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    ids = accessible_farm_ids(user)
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM alarm_log ORDER BY time DESC, id DESC").fetchall()
-    alarms = []
-    for row in rows:
-        key = metric_to_sensor_key(row["metric"])
-        if not key or key not in SENSOR_DEFINITIONS:
-            continue
-        definition = SENSOR_DEFINITIONS[key]
-        if definition["name"] not in enabled_names:
-            continue
-        level = LEVEL_TEXT.get(row["level"], "提醒")
-        status = STATUS_TEXT.get(row["status"], "未处理")
-        pool = normalize_pond_name(row["pool"])
-        alarms.append({
-            "id": row["id"],
-            "time": row["time"],
-            "pondId": int("".join(ch for ch in pool if ch.isdigit()) or 1),
-            "pondName": pool,
-            "pool": pool,
-            "key": key,
-            "sensorName": definition["name"],
-            "metric": definition["name"],
-            "value": row["value"],
-            "level": level,
-            "levelText": level,
-            "content": row["content"],
-            "status": status,
-            "statusText": status,
-        })
-    return alarms
+        rows = conn.execute(
+            f"""
+            SELECT f.*, COUNT(p.id) AS pond_count
+            FROM farms f LEFT JOIN ponds p ON p.farm_id = f.id
+            WHERE f.id IN ({placeholders})
+            GROUP BY f.id ORDER BY f.id
+            """,
+            ids,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/ponds")
+def ponds(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    selected = ensure_farm_access(user, farm_id)
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM ponds WHERE farm_id = ? ORDER BY id", (selected,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/dashboard")
+def dashboard(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    selected = ensure_farm_access(user, farm_id)
+    latest = [reading_dict(row) for row in latest_rows(selected)]
+    with get_conn() as conn:
+        farm = dict(conn.execute("SELECT * FROM farms WHERE id = ?", (selected,)).fetchone())
+        pond_count = conn.execute("SELECT COUNT(*) FROM ponds WHERE farm_id = ?", (selected,)).fetchone()[0]
+        device_count = conn.execute("SELECT COUNT(*) FROM devices WHERE farm_id = ?", (selected,)).fetchone()[0]
+        online_count = conn.execute(
+            "SELECT COUNT(*) FROM devices WHERE farm_id = ? AND communication_status = 'online'", (selected,)
+        ).fetchone()[0]
+        alarm_count = conn.execute(
+            "SELECT COUNT(*) FROM alarm_logs WHERE farm_id = ? AND status = 'pending'", (selected,)
+        ).fetchone()[0]
+    return {
+        "farm": farm,
+        "summary": {
+            "pond_count": pond_count,
+            "device_count": device_count,
+            "online_count": online_count,
+            "pending_alarm_count": alarm_count,
+        },
+        "latest": latest,
+    }
 
 
 @app.get("/api/latest")
-def get_latest() -> dict[str, Any]:
-    settings = read_settings()
-    sensors = enabled_sensor_rows()
-    metrics = [sensor_to_metric(row) for row in sensors]
-    devices = [
-        {
-            "key": row["sensor_key"],
-            "name": f"{row['name']} 传感器",
-            "sensorName": row["name"],
-            "unit": row["unit"] or "",
-            "status": "在线" if row["enabled"] else "离线",
-            "location": f"{(index % settings['pondCount']) + 1}号池",
-        }
-        for index, row in enumerate(sensors)
-    ]
-    sensor_count = len(metrics)
-    return {
-        "config": {"pondCount": settings["pondCount"], "enabledSensors": settings["enabledSensors"]},
-        "system": {
-            "pondCount": settings["pondCount"],
-            "sensorCount": sensor_count,
-            "onlineSensorCount": sensor_count,
-            "onlineDevices": f"{sensor_count}/{sensor_count}",
-            "todayAlarms": 0,
-            "status": "运行正常",
-        },
-        "ponds": build_ponds(settings["pondCount"]),
-        "metrics": metrics,
-        "alarms": alarm_rows(),
-        "devices": devices,
-    }
+def latest(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    return [reading_dict(row) for row in latest_rows(ensure_farm_access(user, farm_id))]
 
 
 @app.get("/api/history")
-def get_history(metric: str = Query("do"), range_key: str = Query("30m", alias="range")) -> list[dict[str, Any]]:
-    step = RANGE_STEPS.get(range_key, 1)
-    row = next((sensor for sensor in SENSORS if sensor["key"] == metric), SENSORS[0])
-    now = datetime.now()
-    history = []
-    for index in range(30):
-        time_point = now - timedelta(minutes=(29 - index) * step)
-        span = 0.08 if row["key"] == "ph" else max(1, row["value"] * 0.035)
-        value = row["value"] + math.sin(index / 3) * span + math.cos(index / 5) * span * 0.45
-        if row["key"] in {"waterLevel", "orp"}:
-            value = round(value)
-        elif row["key"] == "ph":
-            value = round(value, 2)
-        else:
-            value = round(value, 1)
-        history.append({"time": time_point.strftime("%H:%M"), "value": value})
-    return history
+def history(
+    metric: str = "do",
+    range_key: str = Query("24h", alias="range"),
+    farm_id: int | None = None,
+    pond_id: int | None = None,
+    user: dict[str, Any] = Depends(current_user),
+) -> list[dict[str, Any]]:
+    selected = ensure_farm_access(user, farm_id)
+    column_map = {
+        "do": "do_value", "water_temp": "water_temp", "ph": "ph_value",
+        "orp": "orp_value", "water_level": "water_level",
+        "salinity": "salinity", "room_temp": "room_temp",
+    }
+    if metric not in column_map:
+        raise HTTPException(status_code=400, detail="不支持的指标")
+    hours = {"30m": 0.5, "1h": 1, "6h": 6, "12h": 12, "24h": 24, "7d": 168}.get(range_key, 24)
+    since = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    params: list[Any] = [selected, since]
+    pond_clause = ""
+    if pond_id:
+        with get_conn() as conn:
+            pond = conn.execute("SELECT farm_id FROM ponds WHERE id = ?", (pond_id,)).fetchone()
+        if not pond or pond["farm_id"] != selected:
+            raise HTTPException(status_code=403, detail="无权访问该池塘")
+        pond_clause = "AND sr.pond_id = ?"
+        params.append(pond_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT sr.timestamp, sr.{column_map[metric]} AS value, sr.pond_id, p.name AS pond_name
+            FROM sensor_readings sr JOIN ponds p ON p.id = sr.pond_id
+            WHERE sr.farm_id = ? AND sr.timestamp >= ? {pond_clause}
+            ORDER BY sr.timestamp
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/alarms")
-def get_alarms() -> list[dict[str, Any]]:
-    return alarm_rows()
-
-
-@app.post("/api/alarms/{alarm_id}/handled")
-def handle_alarm(alarm_id: int) -> dict[str, Any]:
+def alarms(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    selected = ensure_farm_access(user, farm_id)
     with get_conn() as conn:
-        cursor = conn.execute("UPDATE alarm_log SET status = ? WHERE id = ?", ("已处理", alarm_id))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Alarm not found")
-    return {"success": True, "id": alarm_id}
+        rows = conn.execute(
+            """
+            SELECT a.*, p.name AS pond_name,
+                   COALESCE(u.display_name, '') AS handled_by_name
+            FROM alarm_logs a
+            JOIN ponds p ON p.id = a.pond_id
+            LEFT JOIN users u ON u.id = a.handled_by
+            WHERE a.farm_id = ?
+            ORDER BY a.created_at DESC
+            """,
+            (selected,),
+        ).fetchall()
+    return [
+        {
+            **dict(row),
+            "sensor_name": SENSOR_DEFINITIONS.get(row["metric"], {}).get("name", row["metric"]),
+            "unit": SENSOR_DEFINITIONS.get(row["metric"], {}).get("unit", ""),
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/alarms/{alarm_id}/handle")
+def handle_alarm(alarm_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, bool]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT farm_id FROM alarm_logs WHERE id = ?", (alarm_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="报警不存在")
+        ensure_farm_access(user, row["farm_id"])
+        conn.execute(
+            """
+            UPDATE alarm_logs SET status = 'handled', handled_at = ?, handled_by = ?
+            WHERE id = ?
+            """,
+            (datetime.now().isoformat(timespec="seconds"), user["id"], alarm_id),
+        )
+    return {"success": True}
 
 
 @app.get("/api/settings")
-def get_settings() -> dict[str, Any]:
-    return read_settings()
+def get_settings(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    selected = ensure_farm_access(user, farm_id)
+    with get_conn() as conn:
+        rows = conn.execute("SELECT metric, min_value, max_value FROM thresholds WHERE farm_id = ?", (selected,)).fetchall()
+    return {"farm_id": selected, "thresholds": [dict(row) for row in rows]}
 
 
 @app.post("/api/settings")
-def post_settings(payload: SettingsPayload) -> dict[str, Any]:
-    return write_settings(payload.model_dump(exclude_unset=True))
+def save_settings(payload: ThresholdPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, bool]:
+    selected = ensure_farm_access(user, payload.farm_id)
+    grouped: dict[str, dict[str, float]] = {}
+    for key, value in payload.values.items():
+        suffix = "_min" if key.endswith("_min") else "_max" if key.endswith("_max") else ""
+        metric = key[: -len(suffix)] if suffix else key
+        if metric in SENSOR_DEFINITIONS and suffix:
+            grouped.setdefault(metric, {})[suffix[1:]] = value
+    with get_conn() as conn:
+        for metric, values in grouped.items():
+            current = conn.execute(
+                "SELECT min_value, max_value FROM thresholds WHERE farm_id = ? AND metric = ?",
+                (selected, metric),
+            ).fetchone()
+            low = values.get("min", current["min_value"] if current else None)
+            high = values.get("max", current["max_value"] if current else None)
+            conn.execute(
+                """
+                INSERT INTO thresholds (farm_id, metric, min_value, max_value) VALUES (?, ?, ?, ?)
+                ON CONFLICT(farm_id, metric) DO UPDATE SET min_value = excluded.min_value, max_value = excluded.max_value
+                """,
+                (selected, metric, low, high),
+            )
+    return {"success": True}
 
 
 @app.get("/api/sensors")
-def get_sensors() -> dict[str, Any]:
-    settings = read_settings()
-    sensors = enabled_sensor_rows()
-    all_sensors = []
+def sensors(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    selected = ensure_farm_access(user, farm_id)
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM sensor_config").fetchall()
-    for row in rows:
-        definition = SENSOR_DEFINITIONS.get(row["sensor_key"], {})
-        if not definition:
-            continue
-        all_sensors.append(
-            {
-                "key": row["sensor_key"],
-                "name": definition["name"],
-                "unit": definition["unit"],
-                "value": row["base_value"],
-                "status": row["status"],
-                "min": row["min_value"],
-                "max": row["max_value"],
-                "enabled": bool(row["enabled"]),
-            }
-        )
-    return {
-        "sensors": [
-            {
-                "key": row["sensor_key"],
-                "name": f"{row['name']} 传感器",
-                "sensorName": row["name"],
-                "unit": row["unit"] or "",
-                "status": "在线",
-                "location": f"{(index % settings['pondCount']) + 1}号池",
-            }
-            for index, row in enumerate(sensors)
-        ],
-        "metrics": [sensor_to_metric(row) for row in sensors],
-        "allSensors": all_sensors,
-        "operations": ["08:00 系统自动巡检完成", "08:20 水质数据刷新成功", "08:40 后端 API 数据同步完成"],
-        "exceptions": ["今日 07:42 2号池 pH 异常", "昨日 19:35 4号池水位异常"],
-    }
+        rows = conn.execute(
+            """
+            SELECT d.*, p.name AS pond_name FROM devices d
+            LEFT JOIN ponds p ON p.id = d.pond_id
+            WHERE d.farm_id = ? ORDER BY d.id
+            """,
+            (selected,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/feeding/plans")
-def get_feeding_plans() -> list[dict[str, Any]]:
+def feeding_plans(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    selected = ensure_farm_access(user, farm_id)
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM feeding_plan ORDER BY time, id").fetchall()
-    return [
-        {
-            "id": row["id"],
-            "pond": row["pond"],
-            "time": row["time"],
-            "feedName": row["feed_name"],
-            "amountKg": row["amount_kg"],
-            "enabled": bool(row["enabled"]),
-        }
-        for row in rows
-    ]
+        rows = conn.execute(
+            """
+            SELECT fp.*, p.name AS pond_name FROM feed_plans fp
+            JOIN ponds p ON p.id = fp.pond_id
+            WHERE fp.farm_id = ? ORDER BY fp.feed_time, fp.id
+            """,
+            (selected,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.post("/api/feeding/plans")
-def post_feeding_plan(payload: FeedingPlanPayload) -> dict[str, Any]:
+def save_feeding_plan(payload: FeedPlanPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    selected = ensure_farm_access(user, payload.farm_id)
     with get_conn() as conn:
+        pond = conn.execute("SELECT farm_id FROM ponds WHERE id = ?", (payload.pond_id,)).fetchone()
+        if not pond or pond["farm_id"] != selected:
+            raise HTTPException(status_code=400, detail="池塘不属于当前养殖场")
         cursor = conn.execute(
-            "INSERT INTO feeding_plan (pond, time, feed_name, amount_kg, enabled) VALUES (?, ?, ?, ?, ?)",
-            (payload.pond, payload.time, payload.feedName, payload.amountKg, 1 if payload.enabled else 0),
+            """
+            INSERT INTO feed_plans (farm_id, pond_id, feed_time, feed_name, amount_kg, enabled)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (selected, payload.pond_id, payload.feed_time, payload.feed_name, payload.amount_kg, int(payload.enabled)),
         )
-        plan_id = cursor.lastrowid
-    return {"success": True, "id": plan_id}
+    return {"success": True, "id": cursor.lastrowid}
 
 
 @app.get("/api/cameras")
-def get_cameras() -> list[dict[str, Any]]:
+def cameras(farm_id: int | None = None, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    selected = ensure_farm_access(user, farm_id)
     with get_conn() as conn:
-        rows = conn.execute("SELECT * FROM camera_config ORDER BY id").fetchall()
+        ponds_data = conn.execute("SELECT id, name FROM ponds WHERE farm_id = ? ORDER BY id", (selected,)).fetchall()
     return [
-        {
-            "id": row["id"],
-            "name": row["name"],
-            "location": row["location"],
-            "streamUrl": row["stream_url"],
-            "status": row["status"],
-        }
-        for row in rows
+        {"id": pond["id"], "name": f"{pond['name']}摄像头", "location": pond["name"], "status": "reserved", "stream_url": ""}
+        for pond in ponds_data
     ]
 
 
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(FRONTEND_DIR / "index.html")
+@app.post("/api/gateway/ingest")
+def gateway_ingest(
+    payload: GatewayReadingPayload,
+    x_gateway_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if x_gateway_token != GATEWAY_TOKEN:
+        raise HTTPException(status_code=401, detail="网关令牌无效")
+    with get_conn() as conn:
+        device = conn.execute(
+            "SELECT farm_id, pond_id FROM devices WHERE id = ?", (payload.device_id,)
+        ).fetchone()
+        if not device or device["farm_id"] != payload.farm_id or device["pond_id"] != payload.pond_id:
+            raise HTTPException(status_code=400, detail="设备、池塘和养殖场不匹配")
+        timestamp = payload.timestamp or datetime.now().isoformat(timespec="seconds")
+        cursor = conn.execute(
+            """
+            INSERT INTO sensor_readings
+            (farm_id, pond_id, device_id, do_value, water_temp, ph_value, orp_value,
+             water_level, salinity, room_temp, system_status, alarm_status,
+             communication_status, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.farm_id, payload.pond_id, payload.device_id, payload.do_value,
+                payload.water_temp, payload.ph_value, payload.orp_value, payload.water_level,
+                payload.salinity, payload.room_temp, payload.system_status, payload.alarm_status,
+                payload.communication_status, timestamp,
+            ),
+        )
+        conn.execute(
+            "UPDATE devices SET communication_status = ?, last_seen = ? WHERE id = ?",
+            (payload.communication_status, timestamp, payload.device_id),
+        )
+    return {"success": True, "reading_id": cursor.lastrowid}
 
 
-@app.get("/{page_name}.html")
-def html_page(page_name: str) -> FileResponse:
-    page = FRONTEND_DIR / f"{page_name}.html"
-    if not page.exists():
-        raise HTTPException(status_code=404, detail="Page not found")
-    return FileResponse(page)
+@app.get("/api/admin/users")
+def admin_users(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.id, u.username, u.display_name, u.role, u.active,
+                   GROUP_CONCAT(f.name, '、') AS farms
+            FROM users u
+            LEFT JOIN user_farms uf ON uf.user_id = u.id
+            LEFT JOIN farms f ON f.id = uf.farm_id
+            GROUP BY u.id ORDER BY u.id
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.post("/api/admin/users")
+def create_user(payload: UserPayload, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    if payload.role not in {"admin", "operator", "viewer"}:
+        raise HTTPException(status_code=400, detail="角色无效")
+    with get_conn() as conn:
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (username, display_name, password_hash, role, active, created_at)
+                VALUES (?, ?, ?, ?, 1, ?)
+                """,
+                (payload.username, payload.display_name, password_hash(payload.password), payload.role, datetime.now().isoformat()),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="用户名已存在")
+        conn.executemany(
+            "INSERT OR IGNORE INTO user_farms (user_id, farm_id) VALUES (?, ?)",
+            [(cursor.lastrowid, farm_id) for farm_id in payload.farm_ids],
+        )
+    return {"success": True, "id": cursor.lastrowid}
+
+
+@app.post("/api/admin/farms")
+def create_farm(payload: FarmPayload, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO farms (name, location, active, created_at) VALUES (?, ?, 1, ?)",
+            (payload.name, payload.location, datetime.now().isoformat()),
+        )
+        farm_id = cursor.lastrowid
+        pond_rows = [(farm_id, f"{i}号池", f"P{i:02d}") for i in range(1, payload.pond_count + 1)]
+        conn.executemany("INSERT INTO ponds (farm_id, name, code) VALUES (?, ?, ?)", pond_rows)
+        ponds_created = conn.execute("SELECT id, name FROM ponds WHERE farm_id = ? ORDER BY id", (farm_id,)).fetchall()
+        conn.executemany(
+            """
+            INSERT INTO devices
+            (farm_id, pond_id, device_code, name, device_type, communication_status, last_seen)
+            VALUES (?, ?, ?, ?, 'water_gateway', 'offline', NULL)
+            """,
+            [(farm_id, pond["id"], f"JMW-F{farm_id:02d}-P{pond['id']:03d}", f"{pond['name']}水质采集网关") for pond in ponds_created],
+        )
+    return {"success": True, "id": farm_id}
+
+
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "mode": "mock-plc"}
 
 
 app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
+
+
+@app.get("/")
+def root() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "login.html")
+
+
+@app.get("/{page_name}.html")
+def page(page_name: str) -> FileResponse:
+    safe_pages = {
+        "login", "index", "monitoring", "analysis", "alarm", "settings",
+        "device", "feeding", "camera", "management",
+    }
+    if page_name not in safe_pages:
+        raise HTTPException(status_code=404, detail="Page not found")
+    return FileResponse(FRONTEND_DIR / f"{page_name}.html")
