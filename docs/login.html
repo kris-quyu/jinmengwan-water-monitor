@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 - 金梦湾渔业水质在线监测平台</title>
+  <link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body class="login-page" data-page="login">
+  <div class="login-layout">
+    <section class="login-visual">
+      <div class="login-brand">金梦湾渔业<br>水质在线监测平台</div>
+      <div>
+        <p class="login-subtitle">面向多养殖场、多池塘的实时水质监测与设备管理后台。当前阶段使用模拟 PLC 数据，接口结构已为真实网关接入预留。</p>
+        <div class="signal-row"><span></span><span></span><span></span></div>
+      </div>
+    </section>
+    <form class="login-form" id="loginForm">
+      <h1>账号登录</h1>
+      <p>请输入平台账号与密码</p>
+      <div class="field"><label for="username">用户名</label><input id="username" autocomplete="username" value="admin" required></div>
+      <div class="field"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" value="Admin123!" required></div>
+      <div class="form-error" id="loginError"></div>
+      <button class="primary-btn full-btn" type="submit">登录平台</button>
+      <div class="demo-account">管理员：admin / Admin123!<br>一号场：operator1 / Demo123!<br>二号场：operator2 / Demo123!</div>
+    </form>
+  </div>
+  <script src="assets/js/api.js"></script>
+  <script src="assets/js/app.js"></script>
+</body>
+</html>

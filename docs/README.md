@@ -1,26 +1,18 @@
-# 金梦湾渔业水质在线监测平台前端
+# GitHub Pages 静态演示版
 
-前端使用原生 HTML、CSS、JavaScript 和 ECharts。当前通过 `assets/js/api.js` 统一获取数据。
+`docs/` 是金梦湾渔业水质在线监测平台 V0.3 的 GitHub Pages 发布目录。
 
-## 页面
+该目录只用于网页预览：
 
-- `index.html`：首页总览
-- `device.html`：设备管理
-- `analysis.html`：水质分析
-- `alarm.html`：报警记录
-- `settings.html`：参数设置
+- 不连接 FastAPI 后端
+- 不连接 SQLite 数据库
+- 不连接 PLC、RS485 或真实传感器
+- 自动使用 `assets/js/api.js` 内置的 mock 数据
+- 支持动态水池、动态传感器、历史曲线、报警记录、参数设置等 V0.3 页面效果
 
-## 接口层
+GitHub Pages 设置请选择：
 
-`assets/js/api.js` 支持两种模式：
-
-- `DATA_MODE = "api"`：请求 FastAPI 后端。
-- `DATA_MODE = "mock"`：使用 `assets/js/mock-data.js` 的本地假数据。
-
-后端启动后访问 `http://127.0.0.1:8000` 即可打开首页。
-
-## 第一版指标口径
-
-在线指标为：DO、pH、盐度/EC、水温、水位、ORP、室温。
-
-氨氮和亚硝酸盐第一版采用试剂盒人工检测并录入，不作为在线传感器显示。
+```text
+Branch: main
+Folder: /docs
+```

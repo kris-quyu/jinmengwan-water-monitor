@@ -1,64 +1,14 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>金梦湾渔业水质在线监测平台</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>首页总览 - 金梦湾渔业水质在线监测平台</title>
   <link rel="stylesheet" href="assets/css/style.css">
 </head>
-<body>
-  <div class="app-shell">
-    <header class="topbar">
-      <div class="top-meta"><span>当前时间</span><strong data-current-time></strong></div>
-      <div class="brand">金梦湾渔业水质在线监测平台</div>
-      <div class="top-meta right"><span class="status-dot"></span><span>系统状态</span><strong data-system-status></strong></div>
-    </header>
-    <nav class="nav">
-      <a href="index.html" data-page="dashboard">首页总览</a>
-      <a href="device.html" data-page="device">设备管理</a>
-      <a href="analysis.html" data-page="analysis">水质分析</a>
-      <a href="alarm.html" data-page="alarm">报警记录</a>
-      <a href="settings.html" data-page="settings">参数设置</a>
-    </nav>
-    <main class="grid-dashboard">
-      <section class="panel">
-        <h2 class="panel-title">系统概览</h2>
-        <div class="stat-list" id="systemStats"></div>
-      </section>
-      <section class="center-stack">
-        <div class="panel">
-          <h2 class="panel-title">养殖池示意</h2>
-          <div class="pool-map" id="poolMap"></div>
-        </div>
-        <div class="panel">
-          <h2 class="panel-title">核心水质数据</h2>
-          <div class="metric-grid" id="metricCards"></div>
-        </div>
-      </section>
-      <aside class="right-stack">
-        <section class="panel">
-          <h2 class="panel-title">实时水质状态</h2>
-          <div id="waterStatus"></div>
-        </section>
-        <section class="panel">
-          <h2 class="panel-title">最新报警记录</h2>
-          <div id="latestAlarms"></div>
-        </section>
-        <section class="panel">
-          <h2 class="panel-title">设备状态</h2>
-          <div id="deviceStatus"></div>
-        </section>
-      </aside>
-      <section class="panel" style="grid-column: 1 / -1;">
-        <h2 class="panel-title">DO / pH / 温度综合趋势</h2>
-        <div class="chart" id="dashboardTrend"></div>
-      </section>
-    </main>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-  <script src="assets/js/mock-data.js"></script>
+<body data-page="index">
+  <script src="assets/js/echarts.min.js"></script>
   <script src="assets/js/api.js"></script>
-  <script src="assets/js/common.js"></script>
-  <script src="assets/js/dashboard.js"></script>
+  <script src="assets/js/app.js"></script>
 </body>
 </html>
